@@ -25,21 +25,44 @@ library(writexl)
 
 # ---- Paths -------------------------------------------------------------
 
-catchment_rds   <- "1_Data/shapefiles/op_cat/op_cat_simplified.rds"
+op_cat_rds   <- "1_Data/shapefiles/op_cat/op_cat_simplified.rds"
+rbd_rds      <- "1_Data/shapefiles/WFD_River_Basin_Districts_Cycle_2/rbd_simplified.rds"
+mng_cat_rds  <- "1_Data/shapefiles/WFD_Surface_Water_Management_Catchments_Cycle_2/mng_cat_simplified.rds"
+ea_area_rds  <- "1_Data/shapefiles/ea_area/ea_area_simplified.rds"
+
 sites_csv_path  <- "1_Data/biological_data/sites.csv"
 samples_csv_path <- "1_Data/biological_data/samples.csv"
-# Every time a saved site's data is overwritten, its previous values are
-# appended here (never deleted/overwritten themselves) so history is kept.
-site_changelog_csv_path <- "1_Data/biological_data/sites_changelog.csv"
 
 bng_crs <- 27700  # British National Grid (Easting/Northing)
 wgs_crs <- 4326   # lat/lon, required by leaflet
 
 # ---- Data ---------------------------------------------------------------
 
-# Pre-simplified/reprojected catchment polygons (see data-prep step run
-# once against the full WFD shapefile) for fast, responsive rendering.
-op_cat <- readRDS(catchment_rds)
+# Pre-simplified/reprojected polygons for each shapefile level (see
+# 1_Data/shapefiles/prepare_simplified_shapefiles.R for how these .rds
+# files are produced from the raw WFD/EA shapefiles) for fast, responsive
+# rendering.
+op_cat  <- readRDS(op_cat_rds)
+rbd     <- readRDS(rbd_rds)
+mng_cat <- readRDS(mng_cat_rds)
+ea_area <- readRDS(ea_area_rds)
+
+# Levels the shapefile browser can show, each with its own polygon data
+# and the column holding that level's display name. Operational catchment
+# is the only level also recorded directly on saved sites
+# (OPERATIONAL_CATCHMENT), so other levels are resolved down to the
+# operational catchments they spatially overlap when filtering
+# sites/samples (see selected_op_cats() below).
+shapefile_levels <- list(
+  river_basin_district = list(label = "River Basin District",  data = rbd,     name_col = "rbd_name"),
+  management_catchment = list(label = "Management Catchment",  data = mng_cat, name_col = "mncat_name"),
+  operational_catchment = list(label = "Operational Catchment", data = op_cat,  name_col = "operationa"),
+  ea_area               = list(label = "EA Area",               data = ea_area, name_col = "long_name")
+)
+shapefile_level_choices <- setNames(
+  names(shapefile_levels),
+  vapply(shapefile_levels, function(x) x$label, character(1))
+)
 
 # Full Site sheet schema (matches the lab's existing site spreadsheet;
 # column names are all-caps to match that convention). Only SITE_ID/
@@ -48,8 +71,10 @@ op_cat <- readRDS(catchment_rds)
 # as its own input in the manual "Add new site" form.
 site_field_defs <- list(
   list(id = "site_source",            col = "SITE_SOURCE",            type = "text"),
-  list(id = "river_basin_district",   col = "RIVER_BASIN_DISTRICT",   type = "select", choices_from = "river_basi"),
-  list(id = "operational_catchment",  col = "OPERATIONAL_CATCHMENT",  type = "select", choices_from = "operationa"),
+  list(id = "river_basin_district",   col = "RIVER_BASIN_DISTRICT",   type = "select", choices = sort(unique(rbd$rbd_name))),
+  list(id = "management_catchment",   col = "MANAGEMENT_CATCHMENT",   type = "select", choices = sort(unique(mng_cat$mncat_name))),
+  list(id = "operational_catchment",  col = "OPERATIONAL_CATCHMENT",  type = "select", choices = sort(unique(op_cat$operationa))),
+  list(id = "ea_area",                col = "EA_AREA",                type = "select", choices = sort(unique(ea_area$long_name))),
   list(id = "altitude",               col = "ALTITUDE",               type = "numeric"),
   list(id = "slope",                  col = "SLOPE",                  type = "numeric"),
   list(id = "distance_from_source",   col = "DISTANCE_FROM_SOURCE",   type = "numeric"),
@@ -71,7 +96,7 @@ site_field_defs <- list(
 # are filled in automatically by the app (never entered by the user).
 site_text_cols <- c(
   "SITE_SOURCE", "SITE_ID", "EASTING", "NORTHING",
-  "RIVER_BASIN_DISTRICT", "OPERATIONAL_CATCHMENT",
+  "RIVER_BASIN_DISTRICT", "MANAGEMENT_CATCHMENT", "OPERATIONAL_CATCHMENT", "EA_AREA",
   "DATE_ADDED", "DATE_CHANGED"
 )
 site_numeric_cols <- c(
@@ -92,7 +117,7 @@ pad_grid_ref <- function(x) {
 }
 full_site_cols <- c(
   "SITE_SOURCE", "SITE_ID", "EASTING", "NORTHING", "RIVER_BASIN_DISTRICT",
-  "OPERATIONAL_CATCHMENT", "ALTITUDE", "SLOPE", "DISTANCE_FROM_SOURCE",
+  "MANAGEMENT_CATCHMENT", "OPERATIONAL_CATCHMENT", "EA_AREA", "ALTITUDE", "SLOPE", "DISTANCE_FROM_SOURCE",
   "DISCHARGE_CATEGORY", "WIDTH", "DEPTH", "BOULDER_COBBLES", "PEBBLES_GRAVEL",
   "SAND", "SILT_CLAY", "ALKALINITY", "CONDUCTIVITY", "TOTAL_HARDNESS", "CALCIUM",
   "DATE_ADDED", "DATE_CHANGED"
@@ -127,41 +152,28 @@ ensure_cols <- function(df, cols) {
   df[, cols]
 }
 
-full_sample_cols <- c("SITE_ID", "DATE", "WHPT_NTAXA", "WHPT_ASPT", "DATE_ADDED")
+# LIFE is an optional additional macroinvertebrate metric - unlike
+# WHPT_NTAXA/WHPT_ASPT it isn't required for a sample to be valid.
+full_sample_cols <- c("SITE_ID", "SAMPLE_DATE", "WHPT_NTAXA", "WHPT_ASPT", "LIFE", "DATE_ADDED")
 template_sample_cols <- setdiff(full_sample_cols, "DATE_ADDED")
 
 empty_samples <- data.frame(
-  SITE_ID    = character(),
-  DATE       = character(),
-  WHPT_NTAXA = double(),
-  WHPT_ASPT  = double(),
-  DATE_ADDED = character(),
+  SITE_ID     = character(),
+  SAMPLE_DATE = character(),
+  WHPT_NTAXA  = double(),
+  WHPT_ASPT   = double(),
+  LIFE        = double(),
+  DATE_ADDED  = character(),
   stringsAsFactors = FALSE
 )
 
 now_stamp <- function() format(Sys.time(), "%Y-%m-%d %H:%M:%S")
 
-# Before a saved site's data is overwritten, append its current values to
-# the (append-only) change log so nothing is ever silently lost.
-log_site_changes <- function(old_rows, change_type) {
-  if (nrow(old_rows) == 0) return(invisible())
-  old_rows$CHANGE_TIMESTAMP <- now_stamp()
-  old_rows$CHANGE_TYPE <- change_type
-  dir.create(dirname(site_changelog_csv_path), recursive = TRUE, showWarnings = FALSE)
-  write.table(
-    old_rows, site_changelog_csv_path, sep = ",", row.names = FALSE,
-    col.names = !file.exists(site_changelog_csv_path),
-    append = file.exists(site_changelog_csv_path)
-  )
-}
-
 # Replace one or more existing sites (matched by SITE_ID) with new data.
-# The previous values are logged first via log_site_changes(), and
 # DATE_ADDED is carried over from the row being replaced so it always
 # reflects when the site was first created; DATE_CHANGED is stamped now.
 overwrite_sites <- function(current, replacement, change_type = "SITE_OVERWRITTEN") {
   old_rows <- current[current$SITE_ID %in% replacement$SITE_ID, ]
-  log_site_changes(old_rows, change_type)
   match_idx <- match(replacement$SITE_ID, old_rows$SITE_ID)
   replacement$DATE_ADDED <- old_rows$DATE_ADDED[match_idx]
   replacement$DATE_CHANGED <- now_stamp()
@@ -202,20 +214,77 @@ sites_to_wgs84 <- function(sites) {
     st_transform(wgs_crs)
 }
 
-# Filter a Sites data frame down to the given SITE_ID/OPERATIONAL_CATCHMENT/
-# RIVER_BASIN_DISTRICT values. An empty selection for any field means "no
-# filter on that field" (i.e. include every value).
-filter_sites_df <- function(df, site_ids, catchments, rbds) {
-  if (length(site_ids) > 0) df <- df[df$SITE_ID %in% site_ids, ]
-  if (length(catchments) > 0) df <- df[df$OPERATIONAL_CATCHMENT %in% catchments, ]
-  if (length(rbds) > 0) df <- df[df$RIVER_BASIN_DISTRICT %in% rbds, ]
+# For each point in pts_sf (WGS84), return the matching value of name_col
+# from polygons (also WGS84) - i.e. which polygon each point falls inside.
+# Points that don't intersect any polygon (e.g. right on a simplified/
+# generalised boundary) fall back to their nearest polygon, so every
+# point with valid coordinates gets a value.
+lookup_polygon_name <- function(pts_sf, polygons, name_col) {
+  hits <- st_intersects(pts_sf, polygons)
+  first_hit <- vapply(hits, function(h) if (length(h) > 0) h[1] else NA_integer_, integer(1))
+  matched <- polygons[[name_col]][first_hit]
+  missing <- is.na(first_hit)
+  if (any(missing)) {
+    nearest <- st_nearest_feature(pts_sf[missing, ], polygons)
+    matched[missing] <- polygons[[name_col]][nearest]
+  }
+  matched
+}
+
+# Fill in RIVER_BASIN_DISTRICT/OPERATIONAL_CATCHMENT/EA_AREA for any site
+# rows where they're blank, by looking up which polygon each site's
+# EASTING/NORTHING falls inside. Rows that already have a value for a
+# given field are left untouched; rows without usable coordinates are
+# skipped (still blank afterwards).
+infill_site_geography <- function(df) {
+  geo_fields <- list(
+    RIVER_BASIN_DISTRICT  = list(data = rbd,     name_col = "rbd_name"),
+    MANAGEMENT_CATCHMENT  = list(data = mng_cat, name_col = "mncat_name"),
+    OPERATIONAL_CATCHMENT = list(data = op_cat,  name_col = "operationa"),
+    EA_AREA                = list(data = ea_area, name_col = "long_name")
+  )
+  for (col in names(geo_fields)) if (!col %in% names(df)) df[[col]] <- NA_character_
+  if (nrow(df) == 0) return(df)
+
+  is_blank <- function(x) is.na(x) | trimws(as.character(x)) == ""
+  missing_any <- Reduce(`|`, lapply(names(geo_fields), function(col) is_blank(df[[col]])))
+
+  has_coords <- !is_blank(df$EASTING) & !is_blank(df$NORTHING) &
+    grepl("^[0-9]{6}$", df$EASTING) & grepl("^[0-9]{6}$", df$NORTHING)
+  idx <- which(missing_any & has_coords)
+  if (length(idx) == 0) return(df)
+
+  pts <- df[idx, ]
+  pts$.easting_num  <- as.numeric(pts$EASTING)
+  pts$.northing_num <- as.numeric(pts$NORTHING)
+  pts_sf <- st_as_sf(pts, coords = c(".easting_num", ".northing_num"), crs = bng_crs) |>
+    st_transform(wgs_crs)
+
+  for (col in names(geo_fields)) {
+    need <- is_blank(df[[col]][idx])
+    if (!any(need)) next
+    field <- geo_fields[[col]]
+    looked_up <- lookup_polygon_name(pts_sf[need, ], field$data, field$name_col)
+    df[[col]][idx[need]] <- looked_up
+  }
   df
 }
 
-# Filter a Samples data frame to only the given sites and a DATE range.
+# Filter a Sites data frame down to the given SITE_ID/OPERATIONAL_CATCHMENT/
+# RIVER_BASIN_DISTRICT/SITE_SOURCE values. An empty selection for any
+# field means "no filter on that field" (i.e. include every value).
+filter_sites_df <- function(df, site_ids, catchments, rbds, sources) {
+  if (length(site_ids) > 0) df <- df[df$SITE_ID %in% site_ids, ]
+  if (length(catchments) > 0) df <- df[df$OPERATIONAL_CATCHMENT %in% catchments, ]
+  if (length(rbds) > 0) df <- df[df$RIVER_BASIN_DISTRICT %in% rbds, ]
+  if (length(sources) > 0) df <- df[df$SITE_SOURCE %in% sources, ]
+  df
+}
+
+# Filter a Samples data frame to only the given sites and a SAMPLE_DATE range.
 filter_samples_df <- function(samples_df, allowed_site_ids, date_start, date_end) {
   df <- samples_df[samples_df$SITE_ID %in% allowed_site_ids, ]
-  d <- as.Date(df$DATE)
+  d <- as.Date(df$SAMPLE_DATE)
   keep <- !is.na(d) &
     (is.na(date_start) | d >= date_start) &
     (is.na(date_end) | d <= date_end)
@@ -227,7 +296,7 @@ summarise_samples <- function(samples) {
   if (nrow(samples) == 0) {
     return(data.frame(SITE_ID = character(), N_SAMPLES = integer(), LAST_DATE = as.Date(character())))
   }
-  d <- as.Date(samples$DATE)
+  d <- as.Date(samples$SAMPLE_DATE)
   n_samples <- tapply(d, samples$SITE_ID, length)
   last_date <- tapply(d, samples$SITE_ID, max)
   data.frame(
@@ -264,19 +333,21 @@ instructions_df <- data.frame(
     "EASTING/NORTHING must each be a 6-digit British National Grid reference",
     "(e.g. 045123). Values are auto-padded with leading zeros on import if",
     "Excel has stored them as plain numbers.",
-    "Sites sheet optional columns: SITE_SOURCE, RIVER_BASIN_DISTRICT, OPERATIONAL_CATCHMENT,",
-    "ALTITUDE, SLOPE, DISTANCE_FROM_SOURCE, DISCHARGE_CATEGORY, WIDTH, DEPTH, BOULDER_COBBLES,",
-    "PEBBLES_GRAVEL, SAND, SILT_CLAY, ALKALINITY, CONDUCTIVITY, TOTAL_HARDNESS, CALCIUM.",
+    "Sites sheet optional columns: SITE_SOURCE, RIVER_BASIN_DISTRICT, MANAGEMENT_CATCHMENT,",
+    "OPERATIONAL_CATCHMENT, EA_AREA, ALTITUDE, SLOPE, DISTANCE_FROM_SOURCE, DISCHARGE_CATEGORY,",
+    "WIDTH, DEPTH, BOULDER_COBBLES, PEBBLES_GRAVEL, SAND, SILT_CLAY, ALKALINITY, CONDUCTIVITY,",
+    "TOTAL_HARDNESS, CALCIUM.",
     "Leave optional columns blank if unknown - only SITE_ID/EASTING/NORTHING are required.",
+    "If RIVER_BASIN_DISTRICT, MANAGEMENT_CATCHMENT, OPERATIONAL_CATCHMENT, and/or EA_AREA are",
+    "left blank, the app automatically fills them in based on EASTING/NORTHING.",
     "Do not add DATE_ADDED/DATE_CHANGED columns - the app fills these in automatically.",
     "",
-    "Samples sheet columns: SITE_ID, DATE (YYYY-MM-DD), WHPT_NTAXA, WHPT_ASPT.",
+    "Samples sheet required columns: SITE_ID, SAMPLE_DATE (YYYY-MM-DD), WHPT_NTAXA, WHPT_ASPT.",
+    "Samples sheet optional columns: LIFE.",
     "Every SITE_ID used in the Samples sheet must already exist - either",
     "already saved in the app, or included in the Sites sheet of this same file.",
     "",
-    "By default, a Sites row whose SITE_ID already exists is skipped. Tick",
-    "'Overwrite existing sites found in the template' before uploading to replace it",
-    "instead - the previous values are kept in a change log file, never deleted.",
+    "A Sites row whose SITE_ID already exists in the app is skipped on import.",
     "",
     "This Instructions sheet is ignored on upload; no need to delete it."
   )
@@ -305,7 +376,7 @@ build_site_field_input <- function(field) {
     numeric = numericInput(field$id, label, value = NA),
     select = selectInput(
       field$id, label,
-      choices = c("", sort(unique(op_cat[[field$choices_from]]))),
+      choices = c("", field$choices),
       selected = ""
     )
   )
@@ -320,11 +391,6 @@ ui <- fluidPage(
       downloadButton("download_template", "Download template (.xlsx)"),
       hr(),
       fileInput("template_upload", "Upload completed template", accept = ".xlsx"),
-      checkboxInput(
-        "overwrite_sites_upload",
-        "Overwrite existing sites found in the template",
-        value = FALSE
-      ),
       hr(),
       tags$b("Add data manually"),
       checkboxInput("mode_add_site", "Add new site", value = FALSE),
@@ -350,9 +416,10 @@ ui <- fluidPage(
         condition = "input.mode_add_sample == true",
         wellPanel(
           selectInput("sample_site_id", "SITE_ID", choices = character(0)),
-          dateInput("sample_date", "DATE", value = Sys.Date()),
+          dateInput("sample_date", "SAMPLE_DATE", value = Sys.Date()),
           numericInput("whpt_ntaxa", "WHPT_NTAXA", value = NA, step = 1),
           numericInput("whpt_aspt", "WHPT_ASPT", value = NA, step = 0.01),
+          numericInput("life", "LIFE", value = NA),
           actionButton("add_sample", "Add Sample", class = "btn-primary")
         )
       ),
@@ -366,19 +433,44 @@ ui <- fluidPage(
           selectizeInput("dl_site_id", "SITE_ID", choices = character(0), multiple = TRUE),
           selectizeInput("dl_catchment", "OPERATIONAL_CATCHMENT", choices = character(0), multiple = TRUE),
           selectizeInput("dl_rbd", "RIVER_BASIN_DISTRICT", choices = character(0), multiple = TRUE),
-          dateRangeInput("dl_date_range", "Sample DATE range"),
+          selectizeInput("dl_site_source", "SITE_SOURCE", choices = character(0), multiple = TRUE),
+          dateRangeInput("dl_date_range", "SAMPLE_DATE range"),
           downloadButton("download_sites", "Download Sites (.csv)"),
           downloadButton("download_samples", "Download Samples (.csv)"),
-          downloadButton("download_site_changelog", "Download site change log (.csv)")
+          hr(),
+          p("Download every site and sample within the currently selected shapefile area (level + area dropdowns above the map), combined into a single Excel file (Sites + Samples sheets)."),
+          downloadButton("download_catchment_combined", "Download selected area (Sites + Samples .xlsx)")
         )
       )
     ),
     mainPanel(
-      selectInput(
-        "catchment_filter",
-        "Operational catchment",
-        choices = c("All", sort(unique(op_cat$operationa))),
-        selected = "All"
+      fluidRow(
+        column(
+          12,
+          div(
+            style = "display: flex; justify-content: flex-end; gap: 15px; flex-wrap: wrap;",
+            div(
+              style = "min-width: 220px;",
+              selectInput(
+                "shapefile_level",
+                "Shapefile level",
+                choices = shapefile_level_choices,
+                selected = "river_basin_district",
+                width = "100%"
+              )
+            ),
+            div(
+              style = "min-width: 220px;",
+              selectInput(
+                "catchment_filter",
+                "Select area",
+                choices = c("All", sort(unique(rbd$rbd_name))),
+                selected = "All",
+                width = "100%"
+              )
+            )
+          )
+        )
       ),
       leafletOutput("map", height = 600),
       hr(),
@@ -394,10 +486,15 @@ ui <- fluidPage(
 
 server <- function(input, output, session) {
 
-  sites <- reactiveVal(ensure_cols(
+  # Infill any missing RIVER_BASIN_DISTRICT/OPERATIONAL_CATCHMENT/EA_AREA
+  # for sites saved before these fields existed (or left blank), and
+  # persist the result so the fix only has to run once.
+  initial_sites <- infill_site_geography(ensure_cols(
     read_csv_or_default(sites_csv_path, empty_sites, col_classes = sites_col_classes),
     full_site_cols
   ))
+  save_csv(initial_sites, sites_csv_path)
+  sites <- reactiveVal(initial_sites)
   samples <- reactiveVal(ensure_cols(
     read_csv_or_default(samples_csv_path, empty_samples),
     full_sample_cols
@@ -440,12 +537,16 @@ server <- function(input, output, session) {
       session, "dl_rbd",
       choices = sort(unique(s$RIVER_BASIN_DISTRICT[!is.na(s$RIVER_BASIN_DISTRICT) & s$RIVER_BASIN_DISTRICT != ""]))
     )
+    updateSelectizeInput(
+      session, "dl_site_source",
+      choices = sort(unique(s$SITE_SOURCE[!is.na(s$SITE_SOURCE) & s$SITE_SOURCE != ""]))
+    )
   }, ignoreNULL = FALSE)
 
   # Keep the download date-range picker spanning the full range of saved
   # sample dates, so it includes everything by default.
   observeEvent(samples(), {
-    d <- as.Date(samples()$DATE)
+    d <- as.Date(samples()$SAMPLE_DATE)
     d <- d[!is.na(d)]
     rng <- if (length(d) > 0) range(d) else c(Sys.Date(), Sys.Date())
     updateDateRangeInput(session, "dl_date_range", start = rng[1], end = rng[2], min = rng[1], max = rng[2])
@@ -456,22 +557,72 @@ server <- function(input, output, session) {
   # re-render of the map widget.
   output$map <- renderLeaflet({
     leaflet() |>
-      addProviderTiles(providers$CartoDB.Positron) |>
+      addProviderTiles(providers$Esri.WorldGrayCanvas) |>
       fitBounds(
-        st_bbox(op_cat)[["xmin"]], st_bbox(op_cat)[["ymin"]],
-        st_bbox(op_cat)[["xmax"]], st_bbox(op_cat)[["ymax"]]
+        st_bbox(op_cat)[["xmin"]],
+        st_bbox(op_cat)[["ymin"]],
+        st_bbox(op_cat)[["xmax"]],
+        st_bbox(op_cat)[["ymax"]]
       )
   })
+  
 
-  # Redraw the catchment polygon layer when the filter changes: "All"
-  # shows every operational catchment, otherwise just the selected one,
-  # and the map zooms to fit whatever is shown.
-  observeEvent(input$catchment_filter, {
-    filtered <- if (identical(input$catchment_filter, "All")) {
-      op_cat
+  # The sf data + display-name column for the currently selected level.
+  current_level <- reactive({
+    shapefile_levels[[input$shapefile_level]]
+  })
+
+  # When the shapefile level changes, repopulate the area dropdown with
+  # "All" plus every distinct name at that level.
+  observeEvent(input$shapefile_level, {
+    lvl <- shapefile_levels[[input$shapefile_level]]
+    # Prevent downstream reactives (selected_polygons/selected_op_cats)
+    # from firing with the old area value still selected against the
+    # new level's data, which could crash if that value doesn't exist
+    # in the new list of choices.
+    freezeReactiveValue(input, "catchment_filter")
+    updateSelectInput(
+      session, "catchment_filter",
+      choices = c("All", sort(unique(lvl$data[[lvl$name_col]]))),
+      selected = "All"
+    )
+  }, ignoreInit = TRUE)
+
+  # Polygon(s) matching the current level + area selection ("All" matches
+  # every polygon at that level).
+  selected_polygons <- reactive({
+    lvl <- current_level()
+    val <- input$catchment_filter
+    matched <- if (is.null(val) || identical(val, "All")) {
+      lvl$data
     } else {
-      op_cat[op_cat$operationa == input$catchment_filter, ]
+      lvl$data[lvl$data[[lvl$name_col]] == val, ]
     }
+    # Fall back to showing every polygon at this level if the selected
+    # area doesn't exist for it (e.g. transient state right after
+    # switching levels), rather than crashing on an empty selection.
+    if (nrow(matched) == 0) lvl$data else matched
+  })
+
+  # Operational catchments overlapping the current selection - the finest
+  # level, and the only one recorded directly on saved sites
+  # (OPERATIONAL_CATCHMENT). Coarser selections (RBD/management
+  # catchment/EA area) are resolved down via a spatial intersection,
+  # since their polygon boundaries/names don't line up exactly with
+  # op_cat's own attribute columns.
+  selected_op_cats <- reactive({
+    if (identical(input$catchment_filter, "All")) return(op_cat)
+    if (identical(input$shapefile_level, "operational_catchment")) return(selected_polygons())
+    overlap <- lengths(st_intersects(op_cat, st_union(st_geometry(selected_polygons())))) > 0
+    op_cat[overlap, ]
+  })
+
+  # Redraw the polygon layer when the level/area filter changes, and
+  # zoom the map to fit whatever is shown.
+  observeEvent(selected_polygons(), {
+    filtered <- selected_polygons()
+    lvl <- current_level()
+    names <- filtered[[lvl$name_col]]
 
     proxy <- leafletProxy("map") |>
       clearGroup("catchments") |>
@@ -481,12 +632,8 @@ server <- function(input, output, session) {
         color = "#3182bd",
         weight = 1,
         fillOpacity = 0.05,
-        label = ~operationa,
-        popup = ~paste0(
-          "<b>", operationa, "</b><br>",
-          "Management catchment: ", management, "<br>",
-          "River basin district: ", river_basi
-        )
+        label = names,
+        popup = paste0("<b>", lvl$label, ":</b> ", names)
       )
 
     bbox <- st_bbox(filtered)
@@ -528,7 +675,7 @@ server <- function(input, output, session) {
       return()
     }
 
-    required_sample_cols <- c("SITE_ID", "DATE", "WHPT_NTAXA", "WHPT_ASPT")
+    required_sample_cols <- c("SITE_ID", "SAMPLE_DATE", "WHPT_NTAXA", "WHPT_ASPT")
     if (!all(required_sample_cols %in% names(new_samples_raw))) {
       showNotification(
         paste0("Samples sheet must contain columns: ", paste(required_sample_cols, collapse = ", ")),
@@ -548,6 +695,7 @@ server <- function(input, output, session) {
     for (col in site_numeric_cols) candidate_sites[[col]] <- suppressWarnings(as.numeric(candidate_sites[[col]]))
     candidate_sites$EASTING  <- pad_grid_ref(candidate_sites$EASTING)
     candidate_sites$NORTHING <- pad_grid_ref(candidate_sites$NORTHING)
+    candidate_sites <- infill_site_geography(candidate_sites)
 
     well_formed <- !is.na(candidate_sites$SITE_ID) & candidate_sites$SITE_ID != "" &
       !is.na(candidate_sites$EASTING) & !is.na(candidate_sites$NORTHING)
@@ -556,33 +704,14 @@ server <- function(input, output, session) {
     candidate_sites <- candidate_sites[!duplicated(candidate_sites$SITE_ID), ]
 
     matches_existing <- candidate_sites$SITE_ID %in% current_sites$SITE_ID
-    overwrite_enabled <- isTRUE(input$overwrite_sites_upload)
-    sites_overwritten <- 0L
+    sites_skipped <- n_malformed_sites + sum(matches_existing)
+    candidate_sites <- candidate_sites[!matches_existing, ]
+    candidate_sites$DATE_ADDED   <- now_stamp()
+    candidate_sites$DATE_CHANGED <- NA_character_
+    sites_added <- nrow(candidate_sites)
+    updated_sites <- bind_fill(current_sites, candidate_sites)
 
-    if (overwrite_enabled) {
-      to_overwrite <- candidate_sites[matches_existing, ]
-      to_add       <- candidate_sites[!matches_existing, ]
-      sites_overwritten <- nrow(to_overwrite)
-      sites_skipped <- n_malformed_sites
-      to_add$DATE_ADDED   <- now_stamp()
-      to_add$DATE_CHANGED <- NA_character_
-
-      updated_sites <- current_sites
-      if (sites_overwritten > 0) {
-        updated_sites <- overwrite_sites(updated_sites, to_overwrite, "SITE_OVERWRITTEN_IMPORT")
-      }
-      updated_sites <- bind_fill(updated_sites, to_add)
-      sites_added <- nrow(to_add)
-    } else {
-      sites_skipped <- n_malformed_sites + sum(matches_existing)
-      candidate_sites <- candidate_sites[!matches_existing, ]
-      candidate_sites$DATE_ADDED   <- now_stamp()
-      candidate_sites$DATE_CHANGED <- NA_character_
-      sites_added <- nrow(candidate_sites)
-      updated_sites <- bind_fill(current_sites, candidate_sites)
-    }
-
-    if (sites_added > 0 || sites_overwritten > 0) {
+    if (sites_added > 0) {
       sites(updated_sites)
       save_csv(updated_sites, sites_csv_path)
     }
@@ -590,20 +719,21 @@ server <- function(input, output, session) {
     # ---- Samples: SITE_ID must exist among current + newly-added sites.
     known_site_ids <- updated_sites$SITE_ID
     candidate_samples <- data.frame(
-      SITE_ID    = trimws(as.character(new_samples_raw$SITE_ID)),
-      DATE       = parse_dates(new_samples_raw$DATE),
-      WHPT_NTAXA = suppressWarnings(as.numeric(new_samples_raw$WHPT_NTAXA)),
-      WHPT_ASPT  = suppressWarnings(as.numeric(new_samples_raw$WHPT_ASPT)),
-      DATE_ADDED = now_stamp(),
+      SITE_ID     = trimws(as.character(new_samples_raw$SITE_ID)),
+      SAMPLE_DATE = parse_dates(new_samples_raw$SAMPLE_DATE),
+      WHPT_NTAXA  = suppressWarnings(as.numeric(new_samples_raw$WHPT_NTAXA)),
+      WHPT_ASPT   = suppressWarnings(as.numeric(new_samples_raw$WHPT_ASPT)),
+      LIFE        = if ("LIFE" %in% names(new_samples_raw)) suppressWarnings(as.numeric(new_samples_raw$LIFE)) else NA_real_,
+      DATE_ADDED  = now_stamp(),
       stringsAsFactors = FALSE
     )
     valid <- !is.na(candidate_samples$SITE_ID) & candidate_samples$SITE_ID != "" &
-      !is.na(candidate_samples$DATE) &
+      !is.na(candidate_samples$SAMPLE_DATE) &
       !is.na(candidate_samples$WHPT_NTAXA) & !is.na(candidate_samples$WHPT_ASPT) &
       candidate_samples$SITE_ID %in% known_site_ids
     samples_skipped <- sum(!valid)
     candidate_samples <- candidate_samples[valid, ]
-    candidate_samples$DATE <- as.character(candidate_samples$DATE)
+    candidate_samples$SAMPLE_DATE <- as.character(candidate_samples$SAMPLE_DATE)
     samples_added <- nrow(candidate_samples)
 
     if (samples_added > 0) {
@@ -615,7 +745,6 @@ server <- function(input, output, session) {
     showNotification(
       paste0(
         "Import complete. Sites added: ", sites_added,
-        if (overwrite_enabled) paste0(", overwritten: ", sites_overwritten) else "",
         " (skipped: ", sites_skipped, "). ",
         "Samples added: ", samples_added, " (skipped: ", samples_skipped,
         " - unknown SITE_ID, missing/invalid date, or missing WHPT_NTAXA/WHPT_ASPT)."
@@ -668,11 +797,12 @@ server <- function(input, output, session) {
       if (is.character(val) && identical(val, "")) val <- NA
       new_row[[field$col]] <- val
     }
+    new_row <- infill_site_geography(new_row)
 
     if (is_existing) {
       updated <- overwrite_sites(current, new_row)
       showNotification(
-        paste0("Overwrote site '", site_id, "'. Previous values were saved to the change log."),
+        paste0("Overwrote site '", site_id, "'."),
         type = "message"
       )
     } else {
@@ -701,6 +831,7 @@ server <- function(input, output, session) {
     date       <- input$sample_date
     whpt_ntaxa <- input$whpt_ntaxa
     whpt_aspt  <- input$whpt_aspt
+    life       <- input$life
 
     if (is.null(site_id) || site_id == "") {
       showNotification("No sites available - add a site first.", type = "error")
@@ -722,13 +853,15 @@ server <- function(input, output, session) {
     updated <- rbind(
       samples(),
       data.frame(
-        SITE_ID = site_id, DATE = as.character(date),
-        WHPT_NTAXA = whpt_ntaxa, WHPT_ASPT = whpt_aspt
+        SITE_ID = site_id, SAMPLE_DATE = as.character(date),
+        WHPT_NTAXA = whpt_ntaxa, WHPT_ASPT = whpt_aspt, LIFE = life,
+        DATE_ADDED = now_stamp()
       )
     )
     samples(updated)
     save_csv(updated, samples_csv_path)
 
+    updateNumericInput(session, "life", value = NA)
     updateNumericInput(session, "whpt_ntaxa", value = NA)
     updateNumericInput(session, "whpt_aspt", value = NA)
 
@@ -785,12 +918,13 @@ server <- function(input, output, session) {
   }, options = list(pageLength = 5), rownames = FALSE)
 
   # Both downloads honour the same SITE_ID/OPERATIONAL_CATCHMENT/
-  # RIVER_BASIN_DISTRICT filters; leaving them all empty exports every
-  # site/sample. The date range additionally restricts the Samples export.
+  # RIVER_BASIN_DISTRICT/SITE_SOURCE filters; leaving them all empty
+  # exports every site/sample. The date range additionally restricts the
+  # Samples export.
   output$download_sites <- downloadHandler(
     filename = function() "sites.csv",
     content = function(file) {
-      filtered <- filter_sites_df(sites(), input$dl_site_id, input$dl_catchment, input$dl_rbd)
+      filtered <- filter_sites_df(sites(), input$dl_site_id, input$dl_catchment, input$dl_rbd, input$dl_site_source)
       write.csv(filtered, file, row.names = FALSE)
     }
   )
@@ -798,9 +932,34 @@ server <- function(input, output, session) {
   output$download_samples <- downloadHandler(
     filename = function() "samples.csv",
     content = function(file) {
-      allowed_sites <- filter_sites_df(sites(), input$dl_site_id, input$dl_catchment, input$dl_rbd)$SITE_ID
+      allowed_sites <- filter_sites_df(sites(), input$dl_site_id, input$dl_catchment, input$dl_rbd, input$dl_site_source)$SITE_ID
       filtered <- filter_samples_df(samples(), allowed_sites, input$dl_date_range[1], input$dl_date_range[2])
       write.csv(filtered, file, row.names = FALSE)
+    }
+  )
+
+  # Combined export: every site and sample within the shapefile area
+  # currently selected on the map (any level - RBD, management catchment,
+  # operational catchment, or EA area; "All" includes everything), written
+  # into a single Excel file with Sites/Samples sheets. Sites are only
+  # tagged with OPERATIONAL_CATCHMENT, so coarser/other-level selections
+  # are resolved down to the operational catchments they spatially
+  # overlap via selected_op_cats().
+  output$download_catchment_combined <- downloadHandler(
+    filename = function() {
+      area_label <- if (identical(input$catchment_filter, "All")) "all_areas" else input$catchment_filter
+      paste0("sites_and_samples_", gsub("[^A-Za-z0-9]+", "_", area_label), ".xlsx")
+    },
+    content = function(file) {
+      catchment_sites <- if (identical(input$catchment_filter, "All")) {
+        sites()
+      } else {
+        allowed_op_cats <- unique(selected_op_cats()$operationa)
+        sites()[sites()$OPERATIONAL_CATCHMENT %in% allowed_op_cats, ]
+      }
+      catchment_samples <- samples()[samples()$SITE_ID %in% catchment_sites$SITE_ID, ]
+
+      write_xlsx(list(Sites = catchment_sites, Samples = catchment_samples), path = file)
     }
   )
 }
