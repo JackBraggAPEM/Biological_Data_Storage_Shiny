@@ -1,6 +1,6 @@
 #
 # Biological Data Storage Shiny App
-#a
+#
 # Three interaction modes, each gated behind its own checkbox so only one
 # is shown/active at a time:
 #   1. Add new site   - manual form entry for every Site sheet column.
