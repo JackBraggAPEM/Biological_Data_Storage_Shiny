@@ -1,20 +1,3 @@
-#
-# Biological Data Storage Shiny App
-#
-# Three interaction modes, each gated behind its own checkbox so only one
-# is shown/active at a time:
-#   1. Add new site   - manual form entry for every Site sheet column.
-#   2. Add sample      - record a macroinvertebrate sample (WHPT_NTAXA,
-#                         WHPT_ASPT) against an existing site.
-#   3. Download data   - filter and export saved Sites/Samples as CSV.
-# A downloadable Excel template (Sites + Samples sheets) can also be
-# filled in offline and re-uploaded to add many sites/samples at once.
-#
-# Saved sites/samples persist across sessions (stored as CSVs). Hovering
-# over a site marker shows how many samples exist for it and the date
-# of the most recent one.
-#
-
 library(shiny)
 library(leaflet)
 library(sf)
@@ -154,16 +137,25 @@ ensure_cols <- function(df, cols) {
 
 # LIFE is an optional additional macroinvertebrate metric - unlike
 # WHPT_NTAXA/WHPT_ASPT it isn't required for a sample to be valid.
-full_sample_cols <- c("SITE_ID", "SAMPLE_DATE", "WHPT_NTAXA", "WHPT_ASPT", "LIFE", "DATE_ADDED")
+full_sample_cols <- c(
+  "SITE_ID",
+  "SAMPLE_SOURCE",
+  "SAMPLE_DATE",
+  "WHPT_NTAXA",
+  "WHPT_ASPT",
+  "LIFE",
+  "DATE_ADDED"
+)
 template_sample_cols <- setdiff(full_sample_cols, "DATE_ADDED")
 
 empty_samples <- data.frame(
-  SITE_ID     = character(),
-  SAMPLE_DATE = character(),
-  WHPT_NTAXA  = double(),
-  WHPT_ASPT   = double(),
-  LIFE        = double(),
-  DATE_ADDED  = character(),
+  SITE_ID       = character(),
+  SAMPLE_SOURCE = character(),
+  SAMPLE_DATE   = character(),
+  WHPT_NTAXA    = double(),
+  WHPT_ASPT     = double(),
+  LIFE          = double(),
+  DATE_ADDED    = character(),
   stringsAsFactors = FALSE
 )
 
@@ -343,7 +335,7 @@ instructions_df <- data.frame(
     "Do not add DATE_ADDED/DATE_CHANGED columns - the app fills these in automatically.",
     "",
     "Samples sheet required columns: SITE_ID, SAMPLE_DATE (YYYY-MM-DD), WHPT_NTAXA, WHPT_ASPT.",
-    "Samples sheet optional columns: LIFE.",
+    "Samples sheet optional columns: SAMPLE_SOURCE, LIFE.",
     "Every SITE_ID used in the Samples sheet must already exist - either",
     "already saved in the app, or included in the Sites sheet of this same file.",
     "",
@@ -415,6 +407,7 @@ ui <- fluidPage(
       conditionalPanel(
         condition = "input.mode_add_sample == true",
         wellPanel(
+          selectInput("sample_source", "SAMPLE_SOURCE", choices = character(0)),
           selectInput("sample_site_id", "SITE_ID", choices = character(0)),
           dateInput("sample_date", "SAMPLE_DATE", value = Sys.Date()),
           numericInput("whpt_ntaxa", "WHPT_NTAXA", value = NA, step = 1),
@@ -431,6 +424,7 @@ ui <- fluidPage(
         wellPanel(
           p("Leave a filter empty to include every value for that field. The date range only affects the Samples download."),
           selectizeInput("dl_site_id", "SITE_ID", choices = character(0), multiple = TRUE),
+          selectizeInput("dl_sample_source", "SAMPLE_SOURCE", choices = character(0), multiple = TRUE),
           selectizeInput("dl_catchment", "OPERATIONAL_CATCHMENT", choices = character(0), multiple = TRUE),
           selectizeInput("dl_rbd", "RIVER_BASIN_DISTRICT", choices = character(0), multiple = TRUE),
           selectizeInput("dl_site_source", "SITE_SOURCE", choices = character(0), multiple = TRUE),
@@ -499,7 +493,32 @@ server <- function(input, output, session) {
     read_csv_or_default(samples_csv_path, empty_samples),
     full_sample_cols
   ))
-
+  
+  # Keep sample-source dropdowns in sync with saved samples
+  observe({
+    
+    sample_sources <- sort(unique(
+      samples()$SAMPLE_SOURCE[
+        !is.na(samples()$SAMPLE_SOURCE) &
+          samples()$SAMPLE_SOURCE != ""
+      ]
+    ))
+    
+    updateSelectInput(
+      session,
+      "sample_source",
+      choices = c("", sample_sources),
+      selected = ""
+    )
+    
+    updateSelectizeInput(
+      session,
+      "dl_sample_source",
+      choices = sample_sources
+    )
+    
+  })
+  
   # Only one interaction mode active at a time.
   observeEvent(input$mode_add_site, {
     if (isTRUE(input$mode_add_site)) {
@@ -521,9 +540,14 @@ server <- function(input, output, session) {
   })
 
   # Keep the sample form's site dropdown in sync with the current site list.
-  observeEvent(sites(), {
-    updateSelectInput(session, "sample_site_id", choices = sites()$SITE_ID)
-  }, ignoreNULL = FALSE)
+  observe({
+    updateSelectInput(
+      session,
+      "sample_site_id",
+      choices = c("", sort(unique(sites()$SITE_ID))),
+      selected = ""
+    )
+  })
 
   # Keep the download filter choices in sync with the current site list.
   observeEvent(sites(), {
@@ -545,12 +569,14 @@ server <- function(input, output, session) {
 
   # Keep the download date-range picker spanning the full range of saved
   # sample dates, so it includes everything by default.
-  observeEvent(samples(), {
-    d <- as.Date(samples()$SAMPLE_DATE)
-    d <- d[!is.na(d)]
-    rng <- if (length(d) > 0) range(d) else c(Sys.Date(), Sys.Date())
-    updateDateRangeInput(session, "dl_date_range", start = rng[1], end = rng[2], min = rng[1], max = rng[2])
-  }, ignoreNULL = FALSE)
+  dateRangeInput(
+    "dl_date_range",
+    "SAMPLE_DATE range",
+    start = as.Date("1995-01-01"),
+    end = Sys.Date(),
+    min = as.Date("1995-01-01"),
+    max = Sys.Date()
+  )
 
   # Base map: tiles only. Catchment polygons are drawn/redrawn separately
   # below so the (filterable) polygon layer doesn't require a full
@@ -719,7 +745,11 @@ server <- function(input, output, session) {
     # ---- Samples: SITE_ID must exist among current + newly-added sites.
     known_site_ids <- updated_sites$SITE_ID
     candidate_samples <- data.frame(
-      SITE_ID     = trimws(as.character(new_samples_raw$SITE_ID)),
+      SITE_ID       = trimws(as.character(new_samples_raw$SITE_ID)),
+      SAMPLE_SOURCE = if ("SAMPLE_SOURCE" %in% names(new_samples_raw))
+        trimws(as.character(new_samples_raw$SAMPLE_SOURCE))
+      else
+        NA_character_,
       SAMPLE_DATE = parse_dates(new_samples_raw$SAMPLE_DATE),
       WHPT_NTAXA  = suppressWarnings(as.numeric(new_samples_raw$WHPT_NTAXA)),
       WHPT_ASPT   = suppressWarnings(as.numeric(new_samples_raw$WHPT_ASPT)),
@@ -828,6 +858,7 @@ server <- function(input, output, session) {
   # Add a macroinvertebrate sample for an existing site.
   observeEvent(input$add_sample, {
     site_id    <- input$sample_site_id
+    sample_source <- trimws(input$sample_source)
     date       <- input$sample_date
     whpt_ntaxa <- input$whpt_ntaxa
     whpt_aspt  <- input$whpt_aspt
@@ -853,14 +884,19 @@ server <- function(input, output, session) {
     updated <- rbind(
       samples(),
       data.frame(
-        SITE_ID = site_id, SAMPLE_DATE = as.character(date),
-        WHPT_NTAXA = whpt_ntaxa, WHPT_ASPT = whpt_aspt, LIFE = life,
-        DATE_ADDED = now_stamp()
+        SITE_ID       = site_id,
+        SAMPLE_SOURCE = sample_source,
+        SAMPLE_DATE   = as.character(date),
+        WHPT_NTAXA    = whpt_ntaxa,
+        WHPT_ASPT     = whpt_aspt,
+        LIFE          = life,
+        DATE_ADDED    = now_stamp()
       )
     )
     samples(updated)
     save_csv(updated, samples_csv_path)
-
+    
+    updateSelectInput(session, "sample_source", selected = "")
     updateNumericInput(session, "life", value = NA)
     updateNumericInput(session, "whpt_ntaxa", value = NA)
     updateNumericInput(session, "whpt_aspt", value = NA)
