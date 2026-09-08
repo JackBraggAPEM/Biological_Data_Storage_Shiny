@@ -462,6 +462,16 @@ ui <- fluidPage(
                 selected = "All",
                 width = "100%"
               )
+            ),
+            div(
+              style = "min-width: 220px;",
+              selectInput(
+                "map_sample_source",
+                "Sample source",
+                choices = "All",
+                selected = "All",
+                width = "100%"
+              )
             )
           )
         )
@@ -519,6 +529,33 @@ server <- function(input, output, session) {
     
   })
   
+  filtered_sites <- reactive({
+    site_df <- if (identical(input$catchment_filter, "All")) {
+      sites()
+      } else {
+      allowed_op_cats <- unique(
+        selected_op_cats()$operationa
+      )
+      sites()[
+        sites()$OPERATIONAL_CATCHMENT %in% allowed_op_cats,
+      ]
+    }
+    if (
+      !is.null(input$map_sample_source) &&
+      input$map_sample_source != "All"
+    ) {
+      allowed_site_ids <- unique(
+        samples()$SITE_ID[
+          samples()$SAMPLE_SOURCE == input$map_sample_source
+        ]
+      )
+      site_df <- site_df[
+        site_df$SITE_ID %in% allowed_site_ids,
+      ]
+    }
+    site_df
+  })
+  
   # Only one interaction mode active at a time.
   observeEvent(input$mode_add_site, {
     if (isTRUE(input$mode_add_site)) {
@@ -539,6 +576,28 @@ server <- function(input, output, session) {
     }
   })
 
+  observe({
+    
+    sample_sources <- sort(unique(
+      samples()$SAMPLE_SOURCE[
+        !is.na(samples()$SAMPLE_SOURCE) &
+          samples()$SAMPLE_SOURCE != ""
+      ]
+    ))
+    
+    updateSelectInput(
+      session,
+      "map_sample_source",
+      choices = c("All", sample_sources),
+      selected = isolate(
+        if (input$map_sample_source %in% c("All", sample_sources))
+          input$map_sample_source
+        else
+          "All"
+      )
+    )
+    
+  })
   # Keep the sample form's site dropdown in sync with the current site list.
   observe({
     updateSelectInput(
@@ -909,7 +968,7 @@ server <- function(input, output, session) {
   observe({
     proxy <- leafletProxy("map") |> clearMarkers()
 
-    sites_sf <- sites_to_wgs84(sites())
+    sites_sf <- sites_to_wgs84(filtered_sites())
     if (!is.null(sites_sf)) {
       summary_df <- summarise_samples(samples())
       merged <- merge(sites_sf, summary_df, by = "SITE_ID", all.x = TRUE)
