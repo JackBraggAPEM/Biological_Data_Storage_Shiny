@@ -47,6 +47,7 @@ shapefile_level_choices <- setNames(
   vapply(shapefile_levels, function(x) x$label, character(1))
 )
 
+
 # Full Site sheet schema (matches the lab's existing site spreadsheet;
 # column names are all-caps to match that convention). Only SITE_ID/
 # EASTING/NORTHING are required for a site to be usable on the map - the
@@ -433,7 +434,7 @@ ui <- fluidPage(
           downloadButton("download_samples", "Download Samples (.csv)"),
           hr(),
           p("Download every site and sample within the currently selected shapefile area (level + area dropdowns above the map), combined into a single Excel file (Sites + Samples sheets)."),
-          downloadButton("download_catchment_combined", "Download selected area (Sites + Samples .xlsx)")
+          uiOutput("download_area_ui")
         )
       )
     ),
@@ -442,16 +443,9 @@ ui <- fluidPage(
         column(
           12,
           div(
-            style = "display: flex; justify-content: flex-end; gap: 15px; flex-wrap: wrap;",
+            style = "display: flex; justify-content: flex-end; gap: 15px; flex-wrap: wrap; align-items: start;",
             div(
-              style = "min-width: 220px;",
-              selectInput(
-                "shapefile_level",
-                "Shapefile level",
-                choices = shapefile_level_choices,
-                selected = "river_basin_district",
-                width = "100%"
-              )
+              uiOutput("shapefile_level_ui")
             ),
             div(
               style = "min-width: 220px;",
@@ -463,6 +457,7 @@ ui <- fluidPage(
                 width = "100%"
               )
             ),
+            
             div(
               style = "min-width: 220px;",
               selectInput(
@@ -472,6 +467,19 @@ ui <- fluidPage(
                 selected = "All",
                 width = "100%"
               )
+            ),
+            
+            div(
+              style = "min-width: 250px;",
+              fileInput(
+                "custom_shp",
+                "Custom shapefile (.zip)",
+                accept = ".zip"
+              )
+            ),
+            
+            div(
+              style = "min-width: 220px;",
             )
           )
         )
@@ -499,10 +507,87 @@ server <- function(input, output, session) {
   ))
   save_csv(initial_sites, sites_csv_path)
   sites <- reactiveVal(initial_sites)
+  
   samples <- reactiveVal(ensure_cols(
     read_csv_or_default(samples_csv_path, empty_samples),
     full_sample_cols
   ))
+  
+  custom_shapefile <- reactive({
+    
+    req(input$custom_shp)
+    
+    tmp_dir <- tempfile()
+    dir.create(tmp_dir)
+    
+    unzip(
+      input$custom_shp$datapath,
+      exdir = tmp_dir
+    )
+    
+    shp_file <- list.files(
+      tmp_dir,
+      pattern = "\\.shp$",
+      recursive = TRUE,
+      full.names = TRUE
+    )
+    
+    validate(
+      need(length(shp_file) == 1,
+           "ZIP must contain exactly one shapefile")
+    )
+    
+    st_transform(
+      st_read(shp_file, quiet = TRUE),
+      4326
+    )
+    
+  })
+  
+  sites_in_custom_shape <- reactive({
+    
+    req(custom_shapefile())
+    
+    sites_sf <- sites_to_wgs84(sites())
+    
+    req(!is.null(sites_sf))
+    
+    inside <- lengths(
+      st_intersects(
+        sites_sf,
+        st_union(custom_shapefile())
+      )
+    ) > 0
+    
+    sites_sf[inside, ]
+    
+  })
+
+  output$shapefile_level_ui <- renderUI({
+    
+    choices <- shapefile_level_choices
+    
+    if (!is.null(input$custom_shp)) {
+      choices <- c(
+        choices,
+        "Custom Shapefile" = "custom"
+      )
+    }
+    
+    selectInput(
+      "shapefile_level",
+      "Shapefile level",
+      choices = choices,
+      selected = isolate(
+        if (!is.null(input$shapefile_level))
+          input$shapefile_level
+        else
+          "river_basin_district"
+      ),
+      width = "100%"
+    )
+    
+  })
   
   # Keep sample-source dropdowns in sync with saved samples
   observe({
@@ -651,42 +736,95 @@ server <- function(input, output, session) {
       )
   })
   
-
   # The sf data + display-name column for the currently selected level.
   current_level <- reactive({
+    
+    req(input$shapefile_level)
+    
+    if (identical(input$shapefile_level, "custom")) {
+      
+      return(
+        list(
+          label = "Custom Shapefile",
+          data = custom_shapefile()
+        )
+      )
+      
+    }
+    
     shapefile_levels[[input$shapefile_level]]
+    
   })
 
   # When the shapefile level changes, repopulate the area dropdown with
   # "All" plus every distinct name at that level.
-  observeEvent(input$shapefile_level, {
-    lvl <- shapefile_levels[[input$shapefile_level]]
-    # Prevent downstream reactives (selected_polygons/selected_op_cats)
-    # from firing with the old area value still selected against the
-    # new level's data, which could crash if that value doesn't exist
-    # in the new list of choices.
+  observe({
+    
+    req(input$shapefile_level)
+    
+    if (identical(input$shapefile_level, "custom")) {
+      
+      updateSelectInput(
+        session,
+        "catchment_filter",
+        choices = "Custom Area",
+        selected = "Custom Area"
+      )
+      
+      return()
+      
+    }
+    
+    lvl <- current_level()
+    
     freezeReactiveValue(input, "catchment_filter")
+    
     updateSelectInput(
-      session, "catchment_filter",
-      choices = c("All", sort(unique(lvl$data[[lvl$name_col]]))),
+      session,
+      "catchment_filter",
+      choices = c(
+        "All",
+        sort(unique(as.character(lvl$data[[lvl$name_col]])))
+      ),
       selected = "All"
     )
-  }, ignoreInit = TRUE)
+    
+  })
+  
 
   # Polygon(s) matching the current level + area selection ("All" matches
   # every polygon at that level).
   selected_polygons <- reactive({
+    
+    req(input$shapefile_level)
+    
+    if (identical(input$shapefile_level, "custom")) {
+      req(custom_shapefile())
+      return(custom_shapefile())
+    }
+    
     lvl <- current_level()
+    
+    req(input$catchment_filter)
+    
     val <- input$catchment_filter
-    matched <- if (is.null(val) || identical(val, "All")) {
+    
+    if (length(val) == 0 || is.null(val)) {
+      return(lvl$data)
+    }
+    
+    matched <- if (identical(val, "All")) {
       lvl$data
     } else {
       lvl$data[lvl$data[[lvl$name_col]] == val, ]
     }
-    # Fall back to showing every polygon at this level if the selected
-    # area doesn't exist for it (e.g. transient state right after
-    # switching levels), rather than crashing on an empty selection.
-    if (nrow(matched) == 0) lvl$data else matched
+    
+    if (is.null(matched) || nrow(matched) == 0) {
+      lvl$data
+    } else {
+      matched
+    }
+    
   })
 
   # Operational catchments overlapping the current selection - the finest
@@ -696,6 +834,18 @@ server <- function(input, output, session) {
   # since their polygon boundaries/names don't line up exactly with
   # op_cat's own attribute columns.
   selected_op_cats <- reactive({
+    if (identical(input$shapefile_level, "custom")) {
+      
+      overlap <- lengths(
+        st_intersects(
+          op_cat,
+          st_union(st_geometry(custom_shapefile()))
+        )
+      ) > 0
+      
+      return(op_cat[overlap, ])
+      
+    }
     if (identical(input$catchment_filter, "All")) return(op_cat)
     if (identical(input$shapefile_level, "operational_catchment")) return(selected_polygons())
     overlap <- lengths(st_intersects(op_cat, st_union(st_geometry(selected_polygons())))) > 0
@@ -705,25 +855,56 @@ server <- function(input, output, session) {
   # Redraw the polygon layer when the level/area filter changes, and
   # zoom the map to fit whatever is shown.
   observeEvent(selected_polygons(), {
+    
     filtered <- selected_polygons()
-    lvl <- current_level()
-    names <- filtered[[lvl$name_col]]
-
-    proxy <- leafletProxy("map") |>
-      clearGroup("catchments") |>
-      addPolygons(
-        data = filtered,
-        group = "catchments",
-        color = "#3182bd",
-        weight = 1,
-        fillOpacity = 0.05,
-        label = names,
-        popup = paste0("<b>", lvl$label, ":</b> ", names)
-      )
-
+    
+    if (identical(input$shapefile_level, "custom")) {
+      
+      proxy <- leafletProxy("map") |>
+        clearGroup("catchments") |>
+        addPolygons(
+          data = filtered,
+          group = "catchments",
+          color = "red",
+          weight = 2,
+          fillOpacity = 0.1
+        )
+      
+    } else {
+      
+      
+      lvl <- current_level()
+      
+      names <- filtered[[lvl$name_col]]
+      
+      proxy <- leafletProxy("map") |>
+        clearGroup("catchments") |>
+        addPolygons(
+          data = filtered,
+          group = "catchments",
+          color = "#3182bd",
+          weight = 1,
+          fillOpacity = 0.05,
+          label = names,
+          popup = paste0(
+            "<b>", lvl$label, ":</b> ",
+            names
+          )
+        )
+      
+    }
+    
     bbox <- st_bbox(filtered)
-    proxy |> fitBounds(bbox[["xmin"]], bbox[["ymin"]], bbox[["xmax"]], bbox[["ymax"]])
-  }, ignoreNULL = FALSE)
+    
+    proxy |>
+      fitBounds(
+        bbox["xmin"],
+        bbox["ymin"],
+        bbox["xmax"],
+        bbox["ymax"]
+      )
+    
+  })
 
   output$download_template <- downloadHandler(
     filename = function() "site_sample_template.xlsx",
@@ -1040,18 +1221,53 @@ server <- function(input, output, session) {
   # tagged with OPERATIONAL_CATCHMENT, so coarser/other-level selections
   # are resolved down to the operational catchments they spatially
   # overlap via selected_op_cats().
+  
+  output$download_area_ui <- renderUI({
+    
+    label <- if (identical(input$shapefile_level, "custom")) {
+      "Download custom shapefile area (.xlsx)"
+    } else {
+      "Download selected area (.xlsx)"
+    }
+    
+    downloadButton(
+      "download_catchment_combined",
+      label
+    )
+    
+  })
+  
   output$download_catchment_combined <- downloadHandler(
     filename = function() {
       area_label <- if (identical(input$catchment_filter, "All")) "all_areas" else input$catchment_filter
       paste0("sites_and_samples_", gsub("[^A-Za-z0-9]+", "_", area_label), ".xlsx")
     },
     content = function(file) {
-      catchment_sites <- if (identical(input$catchment_filter, "All")) {
-        sites()
+      if (identical(input$shapefile_level, "custom")) {
+        
+        catchment_sites <- st_drop_geometry(
+          sites_in_custom_shape()
+        )
+        
+      } else if (identical(input$catchment_filter, "All")) {
+        
+        catchment_sites <- sites()
+        
       } else {
-        allowed_op_cats <- unique(selected_op_cats()$operationa)
-        sites()[sites()$OPERATIONAL_CATCHMENT %in% allowed_op_cats, ]
+        
+        allowed_op_cats <- unique(
+          selected_op_cats()$operationa
+        )
+        
+        catchment_sites <- sites()[
+          sites()$OPERATIONAL_CATCHMENT %in% allowed_op_cats,
+        ]
+        
       }
+      
+      catchment_samples <- samples()[
+        samples()$SITE_ID %in% catchment_sites$SITE_ID,
+      ]
       catchment_samples <- samples()[samples()$SITE_ID %in% catchment_sites$SITE_ID, ]
 
       write_xlsx(list(Sites = catchment_sites, Samples = catchment_samples), path = file)
